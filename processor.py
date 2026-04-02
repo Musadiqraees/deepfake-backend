@@ -1,52 +1,88 @@
+import cv2
+import numpy as np
+import sqlite3
+import os
 import tensorflow as tf
-from tensorflow.keras.layers import Input, Dense, Flatten, Conv2D, MaxPooling2D, BatchNormalization, Dropout
-from tensorflow.keras.models import Model
+from tensorflow.keras.models import load_model
 
-def build_meso4():
-    # 1. Define the 'Skeleton' (The Architecture)
-    x = Input(shape=(256, 256, 3))
+# --- CONFIGURATION ---
+MODEL_PATH = 'models/Meso4_DF.h5'
+
+# Load model once at startup to save memory on the remote server
+# We use a global variable so the model stays in RAM
+model = None
+
+def get_model():
+    global model
+    if model is None:
+        print("Loading Meso4 Model into memory...")
+        model = load_model(MODEL_PATH)
+    return model
+
+def update_db(job_id, status, result=None, confidence=None):
+    """Writes the AI result back to the SQLite database"""
+    conn = sqlite3.connect("jobs.db")
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE jobs SET status=?, result=?, confidence=? WHERE id=?", 
+        (status, result, confidence, job_id)
+    )
+    conn.commit()
+    conn.close()
+
+def process_video_task(job_id: str, file_path: str):
+    """The background task that runs the AI"""
+    try:
+        # Ensure model is loaded
+        current_model = get_model()
+        
+        cap = cv2.VideoCapture(file_path)
+        predictions = []
+        frame_count = 0
+
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+            
+            # Optimization: Only check every 15th frame (approx 2 frames per second)
+            # This makes the remote server 15x faster without losing accuracy
+            if frame_count % 15 == 0:
+                # MesoNet expects 256x256
+                resized = cv2.resize(frame, (256, 256))
+                normalized = resized.astype('float32') / 255.0
+                input_data = np.expand_dims(normalized, axis=0)
+                
+                # Predict (1.0 = Real, 0.0 = Fake)
+                pred = current_model.predict(input_data, verbose=0)[0][0]
+                predictions.append(pred)
+            
+            frame_count += 1
+        
+        cap.release()
+
+        if not predictions:
+            raise Exception("Could not extract frames from video.")
+
+        # Calculate Final Results
+        avg_score = np.mean(predictions)
+        
+        # Logic: MesoNet output > 0.5 is usually "Real"
+        final_result = "REAL" if avg_score > 0.5 else "FAKE"
+        
+        # Calculate confidence percentage
+        final_confidence = float(avg_score if avg_score > 0.5 else 1.0 - avg_score)
+
+        # Update the DB so the /status/ endpoint can see it
+        update_db(job_id, "completed", final_result, round(final_confidence, 4))
+        print(f"Job {job_id} completed: {final_result}")
+
+    except Exception as e:
+        print(f"Error in background task: {e}")
+        update_db(job_id, "error")
     
-    # Layer 1
-    x1 = Conv2D(8, (3, 3), padding='same', activation='relu')(x)
-    x1 = BatchNormalization()(x1)
-    x1 = MaxPooling2D(pool_size=(2, 2), padding='same')(x1)
-    
-    # Layer 2
-    x2 = Conv2D(8, (5, 5), padding='same', activation='relu')(x1)
-    x2 = BatchNormalization()(x2)
-    x2 = MaxPooling2D(pool_size=(2, 2), padding='same')(x2)
-    
-    # Layer 3
-    x3 = Conv2D(16, (5, 5), padding='same', activation='relu')(x2)
-    x3 = BatchNormalization()(x3)
-    x3 = MaxPooling2D(pool_size=(2, 2), padding='same')(x3)
-    
-    # Layer 4
-    x4 = Conv2D(16, (5, 5), padding='same', activation='relu')(x3)
-    x4 = BatchNormalization()(x4)
-    x4 = MaxPooling2D(pool_size=(4, 4), padding='same')(x4)
-    
-    y = Flatten()(x4)
-    y = Dropout(0.5)(y)
-    y = Dense(16)(y)
-    y = Dropout(0.5)(y)
-    y = Dense(1, activation='sigmoid')(y)
-
-    return Model(inputs=x, outputs=y)
-
-# 2. Create the blank model
-model = build_meso4()
-
-# 3. Load the weights into the blank model
-# This bypasses the 'No model config' error!
-try:
-    model.load_weights('models/Meso4_DF.h5')
-    print("✅ Meso4 Weights Loaded Successfully!")
-except Exception as e:
-    print(f"❌ Error: Could not load weights. {e}")
-
-    # --- At the bottom of processor.py ---
-
-def process_video_task(job_id: str, file_path: str, jobs_db: dict):
-    # ... your video processing code here ...
-    print(f"Processing job {job_id}...")
+    finally:
+        # CRITICAL: Delete the video file to prevent the server disk from filling up
+        if os.path.exists(file_path):
+            os.remove(file_path)
+            print(f"Temporary file {file_path} deleted.")
