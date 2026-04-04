@@ -2,87 +2,67 @@ import cv2
 import numpy as np
 import sqlite3
 import os
-import tensorflow as tf
 from tensorflow.keras.models import load_model
 
-# --- CONFIGURATION ---
-MODEL_PATH = 'models/Meso4_DF.h5'
-
-# Load model once at startup to save memory on the remote server
-# We use a global variable so the model stays in RAM
-model = None
-
-def get_model():
-    global model
-    if model is None:
-        print("Loading Meso4 Model into memory...")
-        model = load_model(MODEL_PATH)
-    return model
-
-def update_db(job_id, status, result=None, confidence=None):
-    """Writes the AI result back to the SQLite database"""
-    conn = sqlite3.connect("jobs.db")
-    cursor = conn.cursor()
-    cursor.execute(
-        "UPDATE jobs SET status=?, result=?, confidence=? WHERE id=?", 
-        (status, result, confidence, job_id)
-    )
-    conn.commit()
-    conn.close()
-
-def process_video_task(job_id: str, file_path: str):
-    """The background task that runs the AI"""
+def process_video_task(job_id, file_path):
     try:
-        # Ensure model is loaded
-        current_model = get_model()
-        
+        # 1. GENERATE THUMBNAIL (Immediate)
         cap = cv2.VideoCapture(file_path)
+        success, first_frame = cap.read()
+        if success:
+            # Resize for mobile list speed (150x150 is perfect for HistoryCard)
+            thumb = cv2.resize(first_frame, (150, 150))
+            # Ensure the directory exists before writing
+            os.makedirs("static/thumbnails", exist_ok=True)
+            cv2.imwrite(f"static/thumbnails/{job_id}.jpg", thumb)
+        
+        # IMPORTANT: Reset video pointer to the start for AI processing
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
+        # 2. RUN AI DETECTION (MesoNet)
+        model = load_model('models/Meso4_DF.h5')
         predictions = []
         frame_count = 0
 
         while cap.isOpened():
             ret, frame = cap.read()
-            if not ret:
-                break
+            if not ret: break
             
-            # Optimization: Only check every 15th frame (approx 2 frames per second)
-            # This makes the remote server 15x faster without losing accuracy
+            # Use your skip-frame optimization (every 15th frame)
             if frame_count % 15 == 0:
-                # MesoNet expects 256x256
                 resized = cv2.resize(frame, (256, 256))
                 normalized = resized.astype('float32') / 255.0
                 input_data = np.expand_dims(normalized, axis=0)
-                
-                # Predict (1.0 = Real, 0.0 = Fake)
-                pred = current_model.predict(input_data, verbose=0)[0][0]
+                pred = model.predict(input_data, verbose=0)[0][0]
                 predictions.append(pred)
-            
             frame_count += 1
         
         cap.release()
 
-        if not predictions:
-            raise Exception("Could not extract frames from video.")
-
-        # Calculate Final Results
+        # 3. CALCULATE FINAL RESULTS
         avg_score = np.mean(predictions)
-        
-        # Logic: MesoNet output > 0.5 is usually "Real"
-        final_result = "REAL" if avg_score > 0.5 else "FAKE"
-        
-        # Calculate confidence percentage
-        final_confidence = float(avg_score if avg_score > 0.5 else 1.0 - avg_score)
+        result = "REAL" if avg_score > 0.5 else "FAKE"
+        confidence = float(avg_score if avg_score > 0.5 else 1.0 - avg_score)
 
-        # Update the DB so the /status/ endpoint can see it
-        update_db(job_id, "completed", final_result, round(final_confidence, 4))
-        print(f"Job {job_id} completed: {final_result}")
+        # 4. UPDATE DB
+        conn = sqlite3.connect("jobs.db")
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE jobs SET status = ?, result = ?, confidence = ? WHERE id = ?",
+            ("completed", result, round(confidence, 4), job_id)
+        )
+        conn.commit()
+        conn.close()
 
     except Exception as e:
-        print(f"Error in background task: {e}")
-        update_db(job_id, "error")
+        print(f"Error: {e}")
+        # Update DB to 'error' status so Android app stops spinning
+        conn = sqlite3.connect("jobs.db")
+        conn.execute("UPDATE jobs SET status = 'error' WHERE id = ?", (job_id,))
+        conn.commit()
+        conn.close()
     
     finally:
-        # CRITICAL: Delete the video file to prevent the server disk from filling up
+        # Clean up the original upload to save server space
         if os.path.exists(file_path):
             os.remove(file_path)
-            print(f"Temporary file {file_path} deleted.")
