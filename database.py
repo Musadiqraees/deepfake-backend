@@ -3,9 +3,9 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from datetime import datetime
 
-# SQLite database file
 SQLALCHEMY_DATABASE_URL = "sqlite:///./jobs.db"
 
+# Vital for SQLite to work with FastAPI background tasks
 engine = create_engine(
     SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False}
 )
@@ -14,15 +14,14 @@ Base = declarative_base()
 
 class JobHistory(Base):
     __tablename__ = "job_history"
-
     id = Column(String, primary_key=True, index=True)
-    status = Column(String, default="processing")
-    result = Column(String, nullable=True)
-    confidence = Column(Float, nullable=True)
+    status = Column(String, default="processing")  # 'processing', 'completed', 'error'
+    result = Column(String, default="Analyzing...")
+    confidence = Column(Float, default=0.0)
     thumbnail_path = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
-# Create tables immediately
+# Initialize table
 Base.metadata.create_all(bind=engine)
 
 def get_db():
