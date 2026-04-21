@@ -197,6 +197,17 @@ def process_video_task(job_id, file_path, base_url): # Added base_url parameter
 
         cap.release()
 
+        # Early exit if no face was detected
+        if last_face is None:
+            job = db.query(JobHistory).filter(JobHistory.id == job_id).first()
+            if job:
+                job.status = "completed"
+                job.result = "NO_FACE"
+                job.confidence = 0.0
+                job.thumbnail_path = f"{base_url}/static/thumbnails/no_face.jpg"
+                db.commit()
+            return
+
         # --- DATABASE UPDATE (Now inside the Try block) ---
         job = db.query(JobHistory).filter(JobHistory.id == job_id).first()
         if job:
@@ -223,6 +234,9 @@ def process_video_task(job_id, file_path, base_url): # Added base_url parameter
                     thumb_path = f"static/thumbnails/{job_id}.jpg"
                     cv2.imwrite(thumb_path, last_face)
                     job.thumbnail_path = f"{base_url}/{thumb_path}"
+                else:
+                    # Use a placeholder thumbnail if no face was detected
+                    job.thumbnail_path = f"{base_url}/static/thumbnails/no_face.jpg"
 
                 job.result = "FAKE" if final_score > 0.5 else "REAL"
                 conf = final_score if final_score > 0.5 else 1.0 - final_score

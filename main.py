@@ -11,7 +11,7 @@ from processor import process_video_task
 app = FastAPI()
 
 # Configuration
-BASE_URL = "https://0ae1-2003-fc-7f1f-b571-7948-fdb-3e21-79ff.ngrok-free.app"
+BASE_URL = "https://801f-84-136-253-121.ngrok-free.app"
 os.makedirs("uploads", exist_ok=True)
 os.makedirs("static/thumbnails", exist_ok=True)
 
@@ -50,7 +50,7 @@ async def detect_media(
     db.commit()
     
     # Fire and forget: AI starts in the background
-    background_tasks.add_task(process_video_task, job_id, file_path)
+    background_tasks.add_task(process_video_task, job_id, file_path, BASE_URL)
     
     return {"job_id": job_id}
 
