@@ -170,6 +170,7 @@ def process_video_task(job_id, file_path, base_url): # Added base_url parameter
                     last_face = face
                     efficientnet_pred = detector.predict_deepfake(face)
                     xception_pred = detector.predict_xception_deepfake(face)
+                    print(f"EfficientNet Prediction: {efficientnet_pred}, XceptionNet Prediction: {xception_pred}")
                     # Simple average ensemble for now
                     predictions.append((efficientnet_pred + xception_pred) / 2.0)
         else:
@@ -186,6 +187,7 @@ def process_video_task(job_id, file_path, base_url): # Added base_url parameter
                         last_face = face
                         efficientnet_pred = detector.predict_deepfake(face)
                         xception_pred = detector.predict_xception_deepfake(face)
+                        print(f"EfficientNet Prediction: {efficientnet_pred}, XceptionNet Prediction: {xception_pred}")
                         # Simple average ensemble for now
                         predictions.append((efficientnet_pred + xception_pred) / 2.0)
             
@@ -193,6 +195,7 @@ def process_video_task(job_id, file_path, base_url): # Added base_url parameter
             audio_file_path = f"/tmp/{job_id}.wav" # Temporary audio file
             if extract_audio_from_video(file_path, audio_file_path):
                 audio_score = detector.predict_audio_deepfake(audio_file_path)
+                print(f"Audio Model Prediction: {audio_score}")
                 audio_predictions.append(audio_score)
 
         cap.release()
@@ -211,24 +214,19 @@ def process_video_task(job_id, file_path, base_url): # Added base_url parameter
         # --- DATABASE UPDATE (Now inside the Try block) ---
         job = db.query(JobHistory).filter(JobHistory.id == job_id).first()
         if job:
-            # Define weights for ensemble
-            visual_weight = 0.7
-            audio_weight = 0.3
-
             final_score = 0.0
-            if len(predictions) > 0 and len(audio_predictions) > 0:
-                # Both visual and audio predictions available
-                avg_visual_score = float(np.mean(predictions))
-                avg_audio_score = float(np.mean(audio_predictions))
-                final_score = (avg_visual_score * visual_weight) + (avg_audio_score * audio_weight)
-            elif len(predictions) > 0:
-                # Only visual predictions available
-                final_score = float(np.mean(predictions))
-            elif len(audio_predictions) > 0:
-                # Only audio predictions available
-                final_score = float(np.mean(audio_predictions))
+            all_predictions = []
+            if len(predictions) > 0:
+                all_predictions.extend(predictions)
+            if len(audio_predictions) > 0:
+                all_predictions.extend(audio_predictions)
             
-            if len(predictions) > 0 or len(audio_predictions) > 0:
+            if len(all_predictions) > 0:
+                final_score = float(np.max(all_predictions))
+            
+            print(f"Final Score (Max Pooling): {final_score}")
+            
+            if len(all_predictions) > 0:
                 # Save the thumbnail
                 if last_face is not None:
                     thumb_path = f"static/thumbnails/{job_id}.jpg"
@@ -238,7 +236,15 @@ def process_video_task(job_id, file_path, base_url): # Added base_url parameter
                     # Use a placeholder thumbnail if no face was detected
                     job.thumbnail_path = f"{base_url}/static/thumbnails/no_face.jpg"
 
-                job.result = "FAKE" if final_score > 0.5 else "REAL"
+                # Classification will be handled after getting the "Uncertain" range
+                # For now, keep the old classification logic, it will be updated in the next step
+                if final_score > 0.60:
+                    job.result = "FAKE"
+                elif final_score < 0.35:
+                    job.result = "REAL"
+                else:
+                    job.result = "UNCERTAIN"
+                
                 conf = final_score if final_score > 0.5 else 1.0 - final_score
                 job.confidence = round(conf * 100, 2)
                 job.status = "completed"
