@@ -1,146 +1,88 @@
-import os
-import cv2
-import numpy as np
-import tensorflow as tf
 import torch
-from transformers import ViTImageProcessor, ViTForImageClassification
-from sqlalchemy.orm import Session
-from database import SessionLocal, JobHistory
+import numpy as np
+import cv2
+from PIL import Image, ImageChops
+from safetensors.torch import load_file
+from timm import create_model
 
-# --- GLOBAL DETECTOR CLASS ---
 class DeepfakeDetector:
-    def __init__(self):
-        print("🧠 Initializing High-Accuracy Human Deepfake Detector...")
+    def __init__(self, model_path='weights/model.safetensors'):
+        self.device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
         
-        # 1. Face Detection (OpenCV)
-        self.face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+        # --- LAYER 1: GENERATIVE (EfficientNet-B4 / ViT) ---
+        # This uses your uploaded Safetensors to find texture glitches
+        self.vit_model = create_model('efficientvit_b0', pretrained=False, num_classes=2)
+        state_dict = load_file(model_path, device=str(self.device))
+        self.vit_model.load_state_dict(state_dict)
+        self.vit_model.to(self.device).eval()
+
+    # --- LAYER 2: FORENSIC (ELA - Error Level Analysis) ---
+    def get_ela_score(self, face_img):
+        """Detects if face pixels have different compression than the background."""
+        # Convert CV2 image to PIL
+        pil_img = Image.fromarray(cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB))
         
-        # 2. Vision Transformer (Human Specialist)
-        # Replacing generic ViT with a fine-tuned deepfake forensic model
-        print("💡 Loading Specialist ViT (prithivMLmods/Deep-Fake-Detector-v2-Model)...")
-        model_id = "prithivMLmods/Deep-Fake-Detector-v2-Model"
-        self.vit_processor = ViTImageProcessor.from_pretrained(model_id)
-        self.vit_model = ViTForImageClassification.from_pretrained(model_id)
-        self.vit_model.eval()
-
-        # 3. Xception (Texture Specialist)
-        # Using the standard pre-trained Xception for high-frequency noise analysis
-        print("💡 Loading Texture Specialist (Xception)...")
-        self.xception_base = tf.keras.applications.Xception(weights='imagenet', include_top=False, pooling='avg')
+        # Save at lower quality then compare
+        temp_file = "temp_ela.jpg"
+        pil_img.save(temp_file, 'JPEG', quality=90)
+        compressed_img = Image.open(temp_file)
         
-        # 4. LSTM (Temporal consistency)
-        self.lstm_model = self._build_lstm()
-
-    def _build_lstm(self):
-        # Input shape: 15 frames, 2048 features from Xception
-        model = tf.keras.Sequential([
-            tf.keras.layers.Input(shape=(15, 2048)), 
-            tf.keras.layers.LSTM(256, return_sequences=False),
-            tf.keras.layers.Dropout(0.3),
-            tf.keras.layers.Dense(1, activation='sigmoid')
-        ])
-        return model
-
-    def get_face_crop(self, frame):
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = self.face_cascade.detectMultiScale(gray, 1.2, 5)
-        if len(faces) == 0: return None
-        # Focus on the largest face (usually the subject)
-        (x, y, w, h) = max(faces, key=lambda f: f[2] * f[3])
-        # Add 20% padding to capture hairline/ear artifacts
-        pad = int(w * 0.20)
-        y1, y2 = max(0, y-pad), min(frame.shape[0], y+h+pad)
-        x1, x2 = max(0, x-pad), min(frame.shape[1], x+w+pad)
-        face = frame[y1:y2, x1:x2]
-        return cv2.resize(face, (224, 224)) # ViT standard size
-
-    def get_hybrid_scores(self, face_image):
-        # --- 1. ViT Specialist Score ---
-        inputs = self.vit_processor(images=face_image, return_tensors="pt")
-        with torch.no_grad():
-            outputs = self.vit_model(**inputs)
-            # The model outputs [Realism_Logit, Deepfake_Logit]
-            # Softmax to get probability for the 'Deepfake' class (index 1)
-            probs = torch.nn.functional.softmax(outputs.logits, dim=-1)
-            vit_score = probs[0][1].item() 
-
-        # --- 2. Xception Features & Score ---
-        # Resize for Xception (299x299)
-        xc_img = cv2.resize(face_image, (299, 299)).astype(np.float32)
-        xc_img = tf.keras.applications.xception.preprocess_input(xc_img)
-        xc_batch = np.expand_dims(xc_img, 0)
+        ela_diff = ImageChops.difference(pil_img, compressed_img)
+        extrema = ela_diff.getextrema()
+        max_diff = max([ex[1] for ex in extrema])
+        scale = 255.0 / (max_diff if max_diff > 0 else 1)
         
-        features = self.xception_base(xc_batch, training=False)
-        # Note: Xception here provides the raw features for the LSTM
-        feat_np = features.numpy().flatten()
+        # Return mean brightness of the difference (higher = more manipulated)
+        return np.array(ela_diff).mean()
+
+    # --- LAYER 3: BIOLOGICAL (rPPG - Heartbeat Consistency) ---
+    def get_biological_score(self, frames):
+        """Analyzes minute skin color changes (blood flow). AI faces don't 'pulse'."""
+        green_channel_avg = []
+        for frame in frames:
+            # Focus on forehead/cheeks where blood flow is most visible
+            roi = frame[20:50, 80:140] 
+            green_channel_avg.append(np.mean(roi[:, :, 1]))
         
-        return vit_score, feat_np
+        # Calculate Variance: Real humans have a rhythmic pulse; Fakes are static or noisy
+        variance = np.var(green_channel_avg)
+        return 1.0 if variance < 0.01 else 0.0 # Low variance = High Fake probability
 
-detector = DeepfakeDetector()
-
-def process_video_task(job_id, file_path, base_url):
-    db = SessionLocal()
-    vit_results, sequence_features = [], []
-    last_face = None
-
-    try:
-        cap = cv2.VideoCapture(file_path)
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        # Sample 15 frames for temporal analysis
-        frame_indices = np.linspace(0, max(0, total_frames - 1), 15, dtype=int)
+    # --- LAYER 4: PHYSICAL (Eye Reflection/Symmetry) ---
+    def get_physical_score(self, face_img):
+        """Checks if both eyes reflect light the same way."""
+        gray = cv2.cvtColor(face_img, cv2.COLOR_BGR2GRAY)
+        # Simplified: Check symmetry of brightest pixels (specular highlights)
+        left_eye = gray[80:110, 60:90]
+        right_eye = gray[80:110, 130:160]
         
-        for idx in frame_indices:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-            ret, frame = cap.read()
-            if not ret: break
-            
-            face = detector.get_face_crop(frame)
-            if face is not None:
-                last_face = face
-                v_score, feat = detector.get_hybrid_scores(face)
-                vit_results.append(v_score)
-                sequence_features.append(feat)
+        # Compare reflection patterns
+        correlation = cv2.matchTemplate(left_eye, right_eye, cv2.TM_CCORR_NORMED)[0][0]
+        return 1.0 - correlation # Lower correlation = More likely fake
+
+    def analyze_full_forensics(self, frames, face_crop):
+        # 1. Generative Score
+        gen_score, _ = self.get_hybrid_scores(face_crop)
         
-        cap.release()
-        job = db.query(JobHistory).filter(JobHistory.id == job_id).first()
+        # 2. Forensic Score
+        forensic_score = self.get_ela_score(face_crop) / 10.0 # Normalized
+        
+        # 3. Biological Score (Requires multiple frames)
+        bio_score = self.get_biological_score(frames)
+        
+        # 4. Physical Score
+        phys_score = self.get_physical_score(face_crop)
 
-        if not vit_results:
-            job.result, job.status, job.confidence = "NO_FACE_DETECTED", "completed", 0.0
-        else:
-            # Save Thumbnail
-            os.makedirs("static/thumbnails", exist_ok=True)
-            cv2.imwrite(f"static/thumbnails/{job_id}.jpg", last_face)
-            job.thumbnail_path = f"{base_url}/static/thumbnails/{job_id}.jpg"
-
-            # --- HEURISTIC SCORING ---
-            # Max pooling: If any frame looks very fake, it's suspicious
-            peak_vit = np.max(vit_results)
-            
-            # Temporal Score (LSTM)
-            while len(sequence_features) < 15: # Pad if video too short
-                sequence_features.append(sequence_features[-1] if sequence_features else np.zeros(2048))
-            
-            seq_arr = np.expand_dims(sequence_features[:15], 0)
-            temp_score = float(detector.lstm_model(seq_arr, training=False).numpy().flatten()[0])
-
-            # WEIGHTING: 60% ViT Specialist, 40% LSTM Temporal
-            final_score = (peak_vit * 0.6) + (temp_score * 0.4)
-
-            # Strict Classification
-            if final_score > 0.60:
-                job.result = "FAKE"
-            elif final_score < 0.30:
-                job.result = "REAL"
-            else:
-                job.result = "UNCERTAIN"
-
-            job.confidence = round(max(final_score, 1 - final_score) * 100, 2)
-            job.status = "completed"
-
-        db.commit()
-    except Exception as e:
-        db.rollback()
-        print(f"Error: {e}")
-    finally:
-        db.close()
-        if os.path.exists(file_path): os.remove(file_path)
+        # FINAL WEIGHTED VOTE
+        # Generative (40%) + Forensic (20%) + Biological (20%) + Physical (20%)
+        final_score = (gen_score * 0.4) + (forensic_score * 0.2) + (bio_score * 0.2) + (phys_score * 0.2)
+        
+        return {
+            "total_fake_probability": final_score,
+            "breakdown": {
+                "texture_glitch": gen_score,
+                "compression_anomaly": forensic_score,
+                "heartbeat_static": bio_score,
+                "eye_asymmetry": phys_score
+            }
+        }
